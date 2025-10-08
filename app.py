@@ -9,14 +9,12 @@ import pandas as pd
 import numpy as np
 
 # ============== OPTIONAL DEPENDENCIES (guarded) ==============
-# Altair for charts
 try:
     import altair as alt
     ALTAIR_OK = True
-except Exception as _e:
+except Exception:
     ALTAIR_OK = False
 
-# scikit-learn for ML discount classification
 SKLEARN_OK = True
 SKLEARN_ERR = ""
 try:
@@ -33,6 +31,61 @@ st.title("Финансовый пайплайн (G1/G2/G3, D-блок, UZS→USD
 st.caption("Загрузка Excel из CRM → нормализация → корректировки → своды → готовый Excel-отчёт")
 
 MONEY_FORMAT_RU = '# ##0,00'  # Excel number format: 1 234 567,89
+
+# ============== HELPERS (columns & formatting) ==============
+def coalesce_duplicate_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Склеиваем дубли заголовков: берём первое непустое слева и удаляем остальные дубли."""
+    out = df.copy()
+    counts = out.columns.value_counts()
+    dup_names = counts[counts > 1].index.tolist()
+    for name in dup_names:
+        idxs = [i for i, c in enumerate(out.columns) if c == name]
+        cols = [out.columns[i] for i in idxs]
+        combined = out[cols].bfill(axis=1).iloc[:, 0]
+        out[name] = combined
+        for c in cols[1:]:
+            out.drop(columns=c, inplace=True)
+    return out
+
+def existing_cols(df: pd.DataFrame, cols: list[str]) -> list[str]:
+    return [c for c in cols if c in set(df.columns)]
+
+def is_amount_col(colname: str) -> bool:
+    lc = str(colname).lower()
+    keys = ["sum", "total", "скидк", "сумм", "цена", "дельта", "usd"]
+    return any(k in lc for k in keys)
+
+def add_totals_row_numeric(df: pd.DataFrame, label="ИТОГО") -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    num_cols = [c for c in out.columns if pd.api.types.is_numeric_dtype(out[c]) and is_amount_col(c)]
+    if not num_cols:
+        return out
+    totals = {c: out[c].sum(skipna=True) for c in num_cols}
+    label_col = None
+    for c in ["plant_name","service_group","warranty_type","ticket_id","Номер заявки"]:
+        if c in out.columns:
+            label_col = c
+            break
+    totals_row = {c: "" for c in out.columns}
+    totals_row.update({c: totals[c] for c in num_cols})
+    if label_col:
+        totals_row[label_col] = label
+    return pd.concat([out, pd.DataFrame([totals_row])], ignore_index=True)
+
+def format_numbers_ru(df: pd.DataFrame) -> pd.DataFrame:
+    """Формат '# ##0,00' для UI-таблиц (строковое представление)."""
+    if df is None or df.empty:
+        return df
+    df_fmt = df.copy()
+    for col in df_fmt.columns:
+        if pd.api.types.is_numeric_dtype(df_fmt[col]):
+            df_fmt[col] = df_fmt[col].apply(
+                lambda x: f"{x:,.2f}".replace(",", "X").replace(".", ",").replace("X", " ")
+                if pd.notnull(x) else ""
+            )
+    return df_fmt
 
 # ============== APP CONFIG DATACLASS ==============
 @dataclass
@@ -86,7 +139,7 @@ class PipelineConfig:
 st.sidebar.header("Настройки входных данных")
 sheet_name = st.sidebar.text_input("Имя листа в Excel", value="Доставленный")
 excluded_types = st.sidebar.text_input("Исключить из затрат завода (через запятую)", value="ВЫЗОВ, ПРОДАЖА")
-sp_labels = st.sidebar.text_input("Метки запчастей (через запчастей)", value="Запчасть")
+sp_labels = st.sidebar.text_input("Метки запчастей (через запятую)", value="Запчасть")
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("Курсы валют и ML скидок")
@@ -101,15 +154,13 @@ uploaded = st.sidebar.file_uploader("Excel из CRM (.xlsx)", type=["xlsx"])
 # ============== CACHING HELPERS ==============
 @st.cache_data(show_spinner=False)
 def read_excel_cached(file_bytes: bytes, sheet: str) -> pd.DataFrame:
-    return pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet)
+    df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet)
+    return df
 
 @st.cache_data(show_spinner=False)
 def read_rates(file) -> pd.DataFrame:
-    # CSV/XLSX, find date/rate columns
-    if file.name.lower().endswith(".csv"):
-        df = pd.read_csv(file)
-    else:
-        df = pd.read_excel(file)
+    df = pd.read_csv(file) if file.name.lower().endswith(".csv") else pd.read_excel(file)
+    df = coalesce_duplicate_columns(df)
     cols = {c.strip().lower(): c for c in df.columns}
     date_col = next((cols[k] for k in cols if k in ("date", "дата")), None)
     rate_col = next((cols[k] for k in cols if k in ("rate", "курс", "uzs_usd", "uzs_to_usd")), None)
@@ -124,19 +175,25 @@ def read_rates(file) -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False)
 def read_training_discounts(file) -> pd.DataFrame:
-    if file.name.lower().endswith(".csv"):
-        df = pd.read_csv(file)
-    else:
-        df = pd.read_excel(file)
+    df = pd.read_csv(file) if file.name.lower().endswith(".csv") else pd.read_excel(file)
+    df = coalesce_duplicate_columns(df)
     low = {c.strip().lower(): c for c in df.columns}
-    desc_col = next((low[k] for k in low if k in ("description", "описание", "discount_desc", "desc")), None)
-    label_col = next((low[k] for k in low if k in ("approved_by", "утверждено", "label", "метка")), None)
+    desc_col = next((low[k] for k in ("description","описание","discount_desc","desc","основание","комментарий") if k in low), None)
+    label_col = next((low[k] for k in ("approved_by","утверждено","label","метка","source","responsible") if k in low), None)
     if not desc_col or not label_col:
         raise ValueError("В обучающем датасете нужны колонки 'description/описание' и 'approved_by/утверждено'.")
     df = df.rename(columns={desc_col: "description", label_col: "approved_by"})
     df["description"] = df["description"].astype(str).fillna("")
-    df["approved_by"] = df["approved_by"].astype(str).str.upper().str.strip()
-    df = df.dropna(subset=["description","approved_by"])
+    df["approved_by"] = df["approved_by"].astype(str).str.strip().str.upper()
+    # Нормализация ярлыков (пример)
+    label_map = {
+        "ЗАВОД": "PLANT", "PLANT": "PLANT",
+        "СЦ": "SC", "SC": "SC", "SERVICE CENTER": "SC",
+        "ДБЛОК": "SP", "СП": "SP", "SPARE PARTS": "SP", "D-BLOCK": "SP"
+    }
+    df["approved_by"] = df["approved_by"].map(lambda x: label_map.get(x, x))
+    df = df.loc[df["description"].str.strip().ne("")]
+    df = df.drop_duplicates(subset=["description","approved_by"])
     return df[["description","approved_by"]]
 
 @st.cache_resource(show_spinner=False)
@@ -150,51 +207,16 @@ def train_discount_classifier(train_df: pd.DataFrame):
     pipe.fit(train_df["description"].values, train_df["approved_by"].values)
     return pipe
 
-# ============== UI HELPERS ==============
-def is_amount_col(colname: str) -> bool:
-    lc = str(colname).lower()
-    keys = ["sum", "total", "скидк", "сумм", "цена", "дельта", "usd"]
-    return any(k in lc for k in keys)
-
-def add_totals_row_numeric(df: pd.DataFrame, label="ИТОГО") -> pd.DataFrame:
-    if df.empty:
-        return df
-    out = df.copy()
-    num_cols = [c for c in out.columns if pd.api.types.is_numeric_dtype(out[c]) and is_amount_col(c)]
-    if not num_cols:
-        return out
-    totals = {c: out[c].sum(skipna=True) for c in num_cols}
-    # choose a label column for 'ИТОГО'
-    label_col = None
-    for c in ["plant_name","service_group","warranty_type","ticket_id","Номер заявки"]:
-        if c in out.columns:
-            label_col = c
-            break
-    totals_row = {c: "" for c in out.columns}
-    totals_row.update({c: totals[c] for c in num_cols})
-    if label_col:
-        totals_row[label_col] = label
-    out = pd.concat([out, pd.DataFrame([totals_row])], ignore_index=True)
-    return out
-
-def format_numbers_ru(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Format all numeric columns using Russian style: '# ##0,00' in UI tables.
-    """
-    df_fmt = df.copy()
-    for col in df_fmt.columns:
-        if pd.api.types.is_numeric_dtype(df_fmt[col]):
-            df_fmt[col] = df_fmt[col].apply(
-                lambda x: f"{x:,.2f}".replace(",", "X").replace(".", ",").replace("X", " ")
-                if pd.notnull(x) else ""
-            )
-    return df_fmt
-
 # ============== PIPELINE FUNCTIONS ==============
-def load_and_normalize(file_bytes: bytes, cfg: PipelineConfig, sheet_name: Optional[str] = None) -> pd.DataFrame:
+@dataclass
+class PipelineConfigRuntime(PipelineConfig):
+    pass
+
+def load_and_normalize(file_bytes: bytes, cfg: PipelineConfigRuntime, sheet_name: Optional[str] = None) -> pd.DataFrame:
     df = read_excel_cached(file_bytes, sheet_name or cfg.src_sheet)
     df.columns = [c.strip() for c in df.columns]
     df = df.rename(columns={k: v for k, v in cfg.rename_map.items() if k in df.columns})
+    df = coalesce_duplicate_columns(df)
 
     for col in cfg.required_cols:
         if col not in df.columns:
@@ -207,7 +229,6 @@ def load_and_normalize(file_bytes: bytes, cfg: PipelineConfig, sheet_name: Optio
     df[["sum_product","sum_service","discount_service","discount_product","service_unit_price"]] = \
         df[["sum_product","sum_service","discount_service","discount_product","service_unit_price"]].fillna(0)
 
-    # normalize dates
     for dcol in ["sps_date","service_date","post_date","sold_at","created_at"]:
         if dcol in df.columns:
             df[dcol] = pd.to_datetime(df[dcol], errors="coerce")
@@ -220,27 +241,20 @@ def load_and_normalize(file_bytes: bytes, cfg: PipelineConfig, sheet_name: Optio
     df["discount_total"] = df["discount_service"] + df["discount_product"]
     return df
 
-def add_line_flags(df: pd.DataFrame, cfg: PipelineConfig) -> pd.DataFrame:
+def add_line_flags(df: pd.DataFrame, cfg: PipelineConfigRuntime) -> pd.DataFrame:
     df = df.copy()
     df["is_excluded_for_manufacturer"] = df["service_group_up"].isin([s.upper() for s in cfg.excluded_for_manufacturer])
     df["is_spare_part"] = df["material_type"].isin(cfg.spare_parts_labels)
     return df
 
-def apply_latest_service_price(df: pd.DataFrame, cfg: PipelineConfig) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Normalize G1/G2 line service prices to the latest price by service_code and sps_date.
-    Excludes spare parts and G3 lines.
-    """
+def apply_latest_service_price(df: pd.DataFrame, cfg: PipelineConfigRuntime) -> tuple[pd.DataFrame, pd.DataFrame]:
     df = df.copy()
     elig = (df["warranty_type"].isin(["G1","G2"])) & (~df["is_spare_part"]) & df["service_code"].notna()
     df_elig = df.loc[elig].copy().sort_values(["service_code","sps_date"])
-
     latest_price_map = (
         df_elig.dropna(subset=["service_unit_price","sps_date"])
-              .groupby("service_code")["service_unit_price"]
-              .last().to_dict()
+              .groupby("service_code")["service_unit_price"].last().to_dict()
     )
-
     old_price = df.loc[elig, "service_unit_price"].copy()
     new_price = df.loc[elig, "service_code"].map(latest_price_map).fillna(old_price)
     qty = df.loc[elig, "qty_service"].fillna(1)
@@ -261,12 +275,11 @@ def apply_latest_service_price(df: pd.DataFrame, cfg: PipelineConfig) -> tuple[p
     audit["old_sum_service"] = old_sum_service_final
     audit["new_sum_service"] = new_sum_service
     audit["delta_sum_service"] = delta
-    audit = audit[audit["delta_sum_service"] != 0]  # keep only changed
+    audit = audit[audit["delta_sum_service"] != 0]
     return df, audit
 
 def apply_usd_conversion(df: pd.DataFrame, rates: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    # as-of merge by sps_date; fallback to other dates if empty
     working_date = df["sps_date"]
     if working_date.isna().all():
         for fallback in ["service_date","post_date","sold_at","created_at"]:
@@ -328,35 +341,34 @@ def warranty_totals_from_id(agg_id: pd.DataFrame) -> pd.DataFrame:
 def ar_by_plant(df: pd.DataFrame, use_usd: bool=False) -> tuple[pd.DataFrame, pd.DataFrame]:
     mask = df["warranty_type"].isin(["G1","G2"]) & (~df["is_excluded_for_manufacturer"])
     cols = ["plant_name","warranty_type","ticket_id"]
-    if use_usd:
-        cols_vals = ["sum_product_usd","sum_service_usd","sum_total_usd","discount_total_usd"]
-    else:
-        cols_vals = ["sum_product","sum_service","sum_total","discount_total"]
-    ar_lines = df.loc[mask, cols + cols_vals]
+    vals = ["sum_product_usd","sum_service_usd","sum_total_usd","discount_total_usd"] if use_usd \
+           else ["sum_product","sum_service","sum_total","discount_total"]
+    ar_lines = df.loc[mask, cols + vals]
     ar_id = (
         ar_lines.groupby(["plant_name","warranty_type","ticket_id"], as_index=False)
-        .agg(**{cols_vals[0]: (cols_vals[0], "sum"),
-                cols_vals[1]: (cols_vals[1], "sum"),
-                cols_vals[2]: (cols_vals[2], "sum"),
-                cols_vals[3]: (cols_vals[3], "sum")})
+        .agg(**{vals[0]: (vals[0], "sum"),
+                vals[1]: (vals[1], "sum"),
+                vals[2]: (vals[2], "sum"),
+                vals[3]: (vals[3], "sum")})
     )
     ar_summary = (
         ar_id.groupby(["plant_name","warranty_type"], as_index=False)
-        .agg(**{cols_vals[0]: (cols_vals[0], "sum"),
-                cols_vals[1]: (cols_vals[1], "sum"),
-                cols_vals[2]: (cols_vals[2], "sum"),
-                cols_vals[3]: (cols_vals[3], "sum")})
-        .sort_values(cols_vals[2], ascending=False)
+        .agg(**{vals[0]: (vals[0], "sum"),
+                vals[1]: (vals[1], "sum"),
+                vals[2]: (vals[2], "sum"),
+                vals[3]: (vals[3], "sum")})
+        .sort_values(vals[2], ascending=False)
     )
     return ar_id, ar_summary
 
 def g3_views(df: pd.DataFrame, use_usd: bool=False) -> tuple[pd.DataFrame, pd.DataFrame]:
-    cols_base = ["service_group","ticket_id","is_spare_part","plant_name"]
-    if use_usd:
-        vals = ["sum_product_usd","sum_service_usd","sum_total_usd","discount_total_usd"]
-    else:
-        vals = ["sum_product","sum_service","sum_total","discount_total"]
+    cols_base = existing_cols(df, ["service_group","ticket_id","is_spare_part","plant_name"])
+    vals = ["sum_product_usd","sum_service_usd","sum_total_usd","discount_total_usd"] if use_usd \
+           else ["sum_product","sum_service","sum_total","discount_total"]
+    vals = existing_cols(df, vals)
     g3_lines = df.loc[df["warranty_type"]=="G3", cols_base + vals].copy()
+    if g3_lines.empty:
+        return g3_lines, pd.DataFrame()
     g3_summary = (
         g3_lines.groupby("service_group", as_index=False)
         .agg(**{vals[0]: (vals[0],"sum"),
@@ -369,36 +381,59 @@ def g3_views(df: pd.DataFrame, use_usd: bool=False) -> tuple[pd.DataFrame, pd.Da
 
 def dblock_outputs(df: pd.DataFrame, use_usd: bool=False) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     mask_pay = df["is_spare_part"] & df["warranty_type"].isin(["G2","G3"])
+    base_cols = existing_cols(df, ["plant_name","warranty_type","ticket_id","product_name","product_code"])
+
     if use_usd:
-        pay_lines = df.loc[mask_pay, ["plant_name","warranty_type","ticket_id","product_name","product_code",
-                                      "sum_product_usd","discount_product_usd"]].copy()
+        vals_src = existing_cols(df, ["sum_product_usd","discount_product_usd"])
+        pay_lines = df.loc[mask_pay, base_cols + vals_src].copy()
         pay_lines = pay_lines.rename(columns={"sum_product_usd":"sum_product","discount_product_usd":"discount_product"})
     else:
-        pay_lines = df.loc[mask_pay, ["plant_name","warranty_type","ticket_id","product_name","product_code",
-                                      "sum_product","discount_product"]].copy()
-    pay_summary = (
-        pay_lines.groupby(["plant_name","warranty_type"], as_index=False)
-        .agg(Сумма_запчастей=("sum_product","sum"),
-             Скидки_по_запчастям_инфо=("discount_product","sum"))
-        .sort_values("Сумма_запчастей", ascending=False)
+        vals_src = existing_cols(df, ["sum_product","discount_product"])
+        pay_lines = df.loc[mask_pay, base_cols + vals_src].copy()
+
+    # Свод
+    sum_cols_ok = existing_cols(pay_lines, ["sum_product","discount_product"])
+    if existing_cols(pay_lines, ["plant_name","warranty_type"]):
+        pay_summary = (
+            pay_lines.groupby(existing_cols(pay_lines, ["plant_name","warranty_type"]), as_index=False)
+            .agg(**{
+                "Сумма_запчастей": (sum_cols_ok[0], "sum") if "sum_product" in sum_cols_ok else ("ticket_id", "size"),
+                "Скидки_по_запчастям_инфо": (sum_cols_ok[1], "sum") if "discount_product" in sum_cols_ok else ("ticket_id", "size"),
+            })
+            .sort_values("Сумма_запчастей", ascending=False, na_position="last")
+        )
+    else:
+        d = {}
+        if "sum_product" in sum_cols_ok:
+            d["Сумма_запчастей"] = [pay_lines["sum_product"].sum()]
+        if "discount_product" in sum_cols_ok:
+            d["Скидки_по_запчастям_инфо"] = [pay_lines["discount_product"].sum()]
+        if not d:
+            d["Сумма_запчастей"] = [len(pay_lines)]
+        pay_summary = pd.DataFrame(d)
+
+    # Реестр скидок по запчастям
+    mask_disc = df["is_spare_part"] & (
+        (df.get("discount_product", 0) > 0) | (df.get("discount_service", 0) > 0) |
+        (df.get("discount_product_usd", 0) > 0) | (df.get("discount_service_usd", 0) > 0)
     )
-    mask_disc = df["is_spare_part"] & ((df.get("discount_product",0)>0) | (df.get("discount_service",0)>0))
+    base_cols_disc = existing_cols(df, ["plant_name","warranty_type","ticket_id","product_name","product_code"])
     if use_usd:
-        disc_register = df.loc[mask_disc,
-            ["plant_name","warranty_type","ticket_id","product_name","product_code",
-             "discount_product_usd","discount_service_usd","sum_product_usd","sum_service_usd","sum_total_usd"]
-        ].copy().rename(columns={
-            "discount_product_usd":"discount_product","discount_service_usd":"discount_service",
-            "sum_product_usd":"sum_product","sum_service_usd":"sum_service","sum_total_usd":"sum_total"
+        vals_disc = existing_cols(df, ["discount_product_usd","discount_service_usd","sum_product_usd","sum_service_usd","sum_total_usd"])
+        disc_register = df.loc[mask_disc, base_cols_disc + vals_disc].copy().rename(columns={
+            "discount_product_usd":"discount_product",
+            "discount_service_usd":"discount_service",
+            "sum_product_usd":"sum_product",
+            "sum_service_usd":"sum_service",
+            "sum_total_usd":"sum_total"
         })
     else:
-        disc_register = df.loc[mask_disc,
-            ["plant_name","warranty_type","ticket_id","product_name","product_code",
-             "discount_product","discount_service","sum_product","sum_service","sum_total"]
-        ].copy()
+        vals_disc = existing_cols(df, ["discount_product","discount_service","sum_product","sum_service","sum_total"])
+        disc_register = df.loc[mask_disc, base_cols_disc + vals_disc].copy()
+
     return pay_lines, pay_summary, disc_register
 
-def build_changed_prices_reports(df_before: pd.DataFrame, audit_price_adj: pd.DataFrame, cfg: PipelineConfig):
+def build_changed_prices_reports(df_before: pd.DataFrame, audit_price_adj: pd.DataFrame, cfg: PipelineConfigRuntime):
     changed_lines = audit_price_adj.rename(columns={
         "ticket_id":"Номер заявки","service_code":"Код услуги","plant_name":"Завод",
         "warranty_type":"Тип гарантии","sps_date":"Дата СПС","qty_service":"Кол-во услуг",
@@ -460,13 +495,10 @@ def ensure_ticket_id_text(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     if "ticket_id" in out.columns:
         def _to_text(x):
-            if pd.isna(x):
-                return ""
+            if pd.isna(x): return ""
             try:
                 as_num = pd.to_numeric(x, errors="coerce")
-                if pd.isna(as_num):
-                    return str(x)
-                return str(int(as_num))
+                return str(int(as_num)) if pd.notna(as_num) else str(x)
             except Exception:
                 return str(x)
         out["ticket_id"] = out["ticket_id"].apply(_to_text)
@@ -475,22 +507,14 @@ def ensure_ticket_id_text(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 def _colnum_to_excel(n: int) -> str:
-    # 0-based index -> Excel column letters
-    s = ""
-    n += 1
+    s, n = "", n + 1
     while n:
         n, r = divmod(n-1, 26)
         s = chr(65 + r) + s
     return s
 
-def write_sheets_to_bytes(sheets: Dict[str, pd.DataFrame]) -> bytes:
-    """
-    Writes multiple DataFrames to a single Excel with:
-    - MONEY_FORMAT_RU on amount columns,
-    - ticket_id/Номер заявки as text,
-    - autofit that preserves formats,
-    - bold 'ИТОГО' row with SUM formulas for amount columns.
-    """
+def write_sheets_to_bytes(sheets: Dict[str, Optional[pd.DataFrame]]) -> bytes:
+    """Пишем несколько DataFrame на листы: формат денег, текстовый ticket_id, автоширина, формулы ИТОГО."""
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
         wb = writer.book
@@ -500,17 +524,19 @@ def write_sheets_to_bytes(sheets: Dict[str, pd.DataFrame]) -> bytes:
         fmt_bold_money = wb.add_format({'bold': True, 'num_format': MONEY_FORMAT_RU})
 
         for sheet_name, df in sheets.items():
+            if df is None or (isinstance(df, pd.DataFrame) and df.empty):
+                continue
             df_to_write = ensure_ticket_id_text(df)
             df_to_write.to_excel(writer, sheet_name=sheet_name, index=False)
             ws = writer.sheets[sheet_name]
 
-            # Which columns look like money?
+            # какие колонки — деньги
             money_cols_idx = []
             for i, c in enumerate(df_to_write.columns):
                 if is_amount_col(c) and pd.api.types.is_numeric_dtype(df_to_write[c]):
                     money_cols_idx.append(i)
 
-            # Apply formats + basic autofit
+            # форматы и ширина по умолчанию
             for i, name in enumerate(df_to_write.columns):
                 if name in ("ticket_id", "Номер заявки"):
                     ws.set_column(i, i, 18, fmt_text)
@@ -519,26 +545,22 @@ def write_sheets_to_bytes(sheets: Dict[str, pd.DataFrame]) -> bytes:
                 else:
                     ws.set_column(i, i, 12)
 
-            # simple autofit preserving formats
+            # autofit с сохранением форматов
             for i, name in enumerate(df_to_write.columns):
                 vals = df_to_write.iloc[:, i].astype(str).head(200).tolist()
                 width = min(max(10, max(len(str(name)), *(len(v) for v in vals)) + 2), 42)
                 keep_fmt = fmt_text if name in ("ticket_id","Номер заявки") else (fmt_money if i in money_cols_idx else None)
                 ws.set_column(i, i, width, keep_fmt)
 
-            # Totals row with formulas
+            # строка ИТОГО
             nrows = len(df_to_write)
             if nrows > 0 and money_cols_idx:
-                total_row_excel = nrows + 1  # 1-based row index (header is row 1)
-                # Put "ИТОГО" in first non-money column or column 0
+                total_row_excel = nrows + 1
                 label_col = 0
                 for j, name in enumerate(df_to_write.columns):
                     if j not in money_cols_idx:
-                        label_col = j
-                        break
+                        label_col = j; break
                 ws.write(total_row_excel, label_col, "ИТОГО", fmt_bold)
-
-                # Each money column: SUM from row 2..nrows+1
                 for j in money_cols_idx:
                     col_letter = _colnum_to_excel(j)
                     formula = f"=SUM({col_letter}2:{col_letter}{nrows+1})"
@@ -552,7 +574,7 @@ def apply_ui_filters(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     c1, c2, c3, c4 = st.columns(4)
     with c1:
-        plants = ["(все)"] + sorted([p for p in df["plant_name"].dropna().astype(str).unique()])
+        plants = ["(все)"] + sorted([p for p in df.get("plant_name", pd.Series(dtype=str)).dropna().astype(str).unique()])
         plant_sel = st.selectbox("Фильтр: завод", plants)
         if plant_sel != "(все)":
             df = df[df["plant_name"] == plant_sel]
@@ -567,9 +589,9 @@ def apply_ui_filters(df: pd.DataFrame) -> pd.DataFrame:
         if w_sel != "(все)":
             df = df[df["warranty_type"] == w_sel]
     with c4:
-        min_d = pd.to_datetime(df["sps_date"]).min()
-        max_d = pd.to_datetime(df["sps_date"]).max()
-        if pd.notna(min_d) and pd.notna(max_d):
+        if "sps_date" in df.columns and df["sps_date"].notna().any():
+            min_d = pd.to_datetime(df["sps_date"]).min()
+            max_d = pd.to_datetime(df["sps_date"]).max()
             start, end = st.date_input("Период по 'дата спс'", value=(min_d.date(), max_d.date()))
             if start and end:
                 mask = (pd.to_datetime(df["sps_date"]).dt.date >= start) & (pd.to_datetime(df["sps_date"]).dt.date <= end)
@@ -577,7 +599,7 @@ def apply_ui_filters(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 # ============== MAIN FLOW ==============
-cfg = PipelineConfig(
+cfg = PipelineConfigRuntime(
     src_sheet=sheet_name,
     excluded_for_manufacturer=tuple([s.strip().upper() for s in excluded_types.split(",") if s.strip()]),
     spare_parts_labels=tuple([s.strip() for s in sp_labels.split(",") if s.strip()]),
@@ -601,7 +623,7 @@ try:
         df, audit_price_adj = apply_latest_service_price(df, cfg)
         changed_summary, changed_lines = build_changed_prices_reports(df_before, audit_price_adj, cfg)
 
-    # Currency conversion (optional)
+    # Конвертация в USD (опционально)
     usd_enabled = False
     if rates_file is not None:
         with st.spinner("Применяем курсы UZS→USD..."):
@@ -611,7 +633,7 @@ try:
     else:
         st.info("Курсы валют не загружены — USD-агрегации будут пропущены.")
 
-    # Aggregations (UZS)
+    # Агрегации (UZS)
     with st.spinner("Строим своды (UZS)..."):
         agg_id = aggregate_by_ticket(df, use_usd=False)
         warranty_totals = warranty_totals_from_id(agg_id)
@@ -619,7 +641,9 @@ try:
         g3_lines, g3_summary = g3_views(df, use_usd=False)
         dblock_pay_lines, dblock_pay_summary, dblock_disc_register = dblock_outputs(df, use_usd=False)
 
-    # Aggregations (USD), if enabled
+    # Агрегации (USD), если есть курсы
+    agg_id_usd = warranty_totals_usd = ar_id_usd = ar_summary_usd = None
+    g3_lines_usd = g3_summary_usd = dblock_pay_lines_usd = dblock_pay_summary_usd = dblock_disc_register_usd = None
     if usd_enabled:
         with st.spinner("Строим своды (USD)..."):
             agg_id_usd = aggregate_by_ticket(df, use_usd=True)
@@ -627,12 +651,9 @@ try:
             ar_id_usd, ar_summary_usd = ar_by_plant(df, use_usd=True)
             g3_lines_usd, g3_summary_usd = g3_views(df, use_usd=True)
             dblock_pay_lines_usd, dblock_pay_summary_usd, dblock_disc_register_usd = dblock_outputs(df, use_usd=True)
-    else:
-        agg_id_usd = warranty_totals_usd = ar_id_usd = ar_summary_usd = None
-        g3_lines_usd = g3_summary_usd = dblock_pay_lines_usd = dblock_pay_summary_usd = dblock_disc_register_usd = None
 
-    # ML classification (optional)
-    confident_ml, review_ml = pd.DataFrame(), pd.DataFrame()
+    # Классификация скидок (опционально)
+    confident_ml = review_ml = pd.DataFrame()
     if ml_training_file is not None and SKLEARN_OK:
         with st.spinner("Обучаем модель скидок и применяем к текущим данным..."):
             train_df = read_training_discounts(ml_training_file)
@@ -671,27 +692,21 @@ try:
         if ml_training_file is None:
             st.info("Не загружен обучающий датасет скидок — классификация пропущена.")
         elif not SKLEARN_OK:
-            st.info(f"ML-модуль недоступен: {SKLEARN_ERR}. Приложение продолжит работу без классификации скидок.")
+            st.info(f"ML-модуль недоступен: {SKLEARN_ERR}. Приложение продолжит работу без ML.")
 
     # ==================== PREVIEW & DASHBOARD ====================
     st.success("Готово! Предпросмотр ключевых сводок ниже, а также кнопка скачивания Excel.")
 
-    # --- DASHBOARD KPI (UZS)
+    # KPI (UZS)
     st.markdown("### 📊 Дашборд — ключевые показатели")
     k1, k2, k3, k4 = st.columns(4)
-    def safe_sum(df_, col): return float(pd.to_numeric(df_.get(col, pd.Series(dtype=float)), errors="coerce").sum())
+    safe_sum = lambda d, c: float(pd.to_numeric(d.get(c, pd.Series(dtype=float)), errors="coerce").sum())
+    k1.metric("Итого оборот (UZS)", f"{safe_sum(df,'sum_total'):,.2f}".replace(",", "X").replace(".", ",").replace("X", " "))
+    k2.metric("Скидки всего (UZS)", f"{safe_sum(df,'discount_total'):,.2f}".replace(",", "X").replace(".", ",").replace("X", " "))
+    k3.metric("Услуги (UZS)", f"{safe_sum(df,'sum_service'):,.2f}".replace(",", "X").replace(".", ",").replace("X", " "))
+    k4.metric("Материалы (UZS)", f"{safe_sum(df,'sum_product'):,.2f}".replace(",", "X").replace(".", ",").replace("X", " "))
 
-    total_uzs = safe_sum(df, "sum_total")
-    total_disc = safe_sum(df, "discount_total")
-    total_service = safe_sum(df, "sum_service")
-    total_product = safe_sum(df, "sum_product")
-
-    k1.metric("Итого оборот (UZS)", f"{total_uzs:,.2f}".replace(",", "X").replace(".", ",").replace("X", " "))
-    k2.metric("Скидки всего (UZS)", f"{total_disc:,.2f}".replace(",", "X").replace(".", ",").replace("X", " "))
-    k3.metric("Услуги (UZS)", f"{total_service:,.2f}".replace(",", "X").replace(".", ",").replace("X", " "))
-    k4.metric("Материалы (UZS)", f"{total_product:,.2f}".replace(",", "X").replace(".", ",").replace("X", " "))
-
-    # --- Optional USD KPI
+    # KPI (USD)
     if "sum_total_usd" in df.columns:
         k5, k6, k7, k8 = st.columns(4)
         k5.metric("Итого оборот (USD)", f"{safe_sum(df,'sum_total_usd'):,.2f}")
@@ -699,40 +714,43 @@ try:
         k7.metric("Услуги (USD)", f"{safe_sum(df,'sum_service_usd'):,.2f}")
         k8.metric("Материалы (USD)", f"{safe_sum(df,'sum_product_usd'):,.2f}")
 
-    # --- CHARTS
+    # Графики
     st.markdown("### 📈 Графики")
     if ALTAIR_OK:
         c1c, c2c = st.columns(2)
-
         with c1c:
-            top_plants = (
-                df[df["warranty_type"].isin(["G1","G2"])]
-                .groupby("plant_name", as_index=False)["sum_total"].sum()
-                .sort_values("sum_total", ascending=False).head(10)
-            )
-            if not top_plants.empty:
-                chart1 = alt.Chart(top_plants).mark_bar().encode(
-                    x=alt.X("sum_total:Q", title="Оборот (UZS)"),
-                    y=alt.Y("plant_name:N", sort='-x', title="Завод"),
-                    tooltip=["plant_name","sum_total"]
-                ).properties(height=320)
-                st.altair_chart(chart1, use_container_width=True)
-
+            if {"plant_name","warranty_type","sum_total"}.issubset(df.columns):
+                top_plants = (
+                    df[df["warranty_type"].isin(["G1","G2"])]
+                    .groupby("plant_name", as_index=False)["sum_total"].sum()
+                    .sort_values("sum_total", ascending=False).head(10)
+                )
+                if not top_plants.empty:
+                    st.altair_chart(
+                        alt.Chart(top_plants).mark_bar().encode(
+                            x=alt.X("sum_total:Q", title="Оборот (UZS)"),
+                            y=alt.Y("plant_name:N", sort='-x', title="Завод"),
+                            tooltip=["plant_name","sum_total"]
+                        ).properties(height=320),
+                        use_container_width=True
+                    )
         with c2c:
-            g3_grp = (
-                df[df["warranty_type"]=="G3"]
-                .groupby("service_group", as_index=False)["sum_total"].sum()
-                .sort_values("sum_total", ascending=False).head(10)
-            )
-            if not g3_grp.empty:
-                chart2 = alt.Chart(g3_grp).mark_bar().encode(
-                    x=alt.X("sum_total:Q", title="Оборот G3 (UZS)"),
-                    y=alt.Y("service_group:N", sort='-x', title="Группа услуг"),
-                    tooltip=["service_group","sum_total"]
-                ).properties(height=320)
-                st.altair_chart(chart2, use_container_width=True)
-
-        if df["sps_date"].notna().any():
+            if {"service_group","warranty_type","sum_total"}.issubset(df.columns):
+                g3_grp = (
+                    df[df["warranty_type"]=="G3"]
+                    .groupby("service_group", as_index=False)["sum_total"].sum()
+                    .sort_values("sum_total", ascending=False).head(10)
+                )
+                if not g3_grp.empty:
+                    st.altair_chart(
+                        alt.Chart(g3_grp).mark_bar().encode(
+                            x=alt.X("sum_total:Q", title="Оборот G3 (UZS)"),
+                            y=alt.Y("service_group:N", sort='-x', title="Группа услуг"),
+                            tooltip=["service_group","sum_total"]
+                        ).properties(height=320),
+                        use_container_width=True
+                    )
+        if "sps_date" in df.columns and df["sps_date"].notna().any():
             ts = (
                 df.dropna(subset=["sps_date"])
                   .assign(day=lambda d: pd.to_datetime(d["sps_date"]).dt.date)
@@ -751,33 +769,26 @@ try:
     else:
         st.info("Altair недоступен — графики отключены.")
 
-    # --- TABLES (with totals row and RU formatting for UI)
+    # Таблицы (UI, с ИТОГО и форматированием)
     c1t, c2t = st.columns(2)
     with c1t:
         st.subheader("Итоги по гарантии (UZS)")
         st.dataframe(format_numbers_ru(add_totals_row_numeric(warranty_totals).head(200)))
-
         st.subheader("AR по заводам — свод (UZS)")
         st.dataframe(format_numbers_ru(add_totals_row_numeric(ar_summary).head(200)))
-
         if usd_enabled:
             st.subheader("Итоги по гарантии (USD)")
             st.dataframe(format_numbers_ru(add_totals_row_numeric(warranty_totals_usd).head(200)))
-
             st.subheader("AR по заводам — свод (USD)")
             st.dataframe(format_numbers_ru(add_totals_row_numeric(ar_summary_usd).head(200)))
-
     with c2t:
         st.subheader("G3 — свод (UZS)")
         st.dataframe(format_numbers_ru(add_totals_row_numeric(g3_summary).head(200)))
-
         if usd_enabled:
             st.subheader("G3 — свод (USD)")
             st.dataframe(format_numbers_ru(add_totals_row_numeric(g3_summary_usd).head(200)))
-
         st.subheader("Изменённые цены (свод)")
         st.dataframe(format_numbers_ru(add_totals_row_numeric(changed_summary).head(200)))
-
         if not confident_ml.empty:
             st.subheader("Скидки (ML, уверенные предсказания)")
             st.dataframe(format_numbers_ru(confident_ml.head(200)))
@@ -800,7 +811,6 @@ try:
         "G1G2_Измененные_Цены_Свод": changed_summary,
         "G1G2_Измененные_Цены_Строки": changed_lines,
     }
-
     if usd_enabled:
         sheets.update({
             "Итоги_по_ID_USD": agg_id_usd,
@@ -813,7 +823,6 @@ try:
             "ДБлок_Кредиторка_Свод_USD": dblock_pay_summary_usd,
             "ДБлок_Скидки_USD": dblock_disc_register_usd,
         })
-
     if not confident_ml.empty:
         sheets["Скидки_Классификация"] = confident_ml
     if not review_ml.empty:
