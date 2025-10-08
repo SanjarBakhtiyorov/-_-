@@ -2,39 +2,39 @@
 import io
 from pathlib import Path
 from dataclasses import dataclass, field
-from typing import Dict, Tuple, List, Optional
+from typing import Dict, Tuple, Optional
 
 import streamlit as st
 import pandas as pd
 import numpy as np
 
-# ML
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.pipeline import Pipeline as SkPipeline
-from sklearn.linear_model import LogisticRegression
+# ============== OPTIONAL DEPENDENCIES (guarded) ==============
+# Altair for charts
+try:
+    import altair as alt
+    ALTAIR_OK = True
+except Exception as _e:
+    ALTAIR_OK = False
 
-def format_numbers_ru(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Format all numeric columns using Russian style: '# ##0,00'
-    Example: 1234567.89 -> '1 234 567,89'
-    """
-    df_fmt = df.copy()
-    for col in df_fmt.columns:
-        if pd.api.types.is_numeric_dtype(df_fmt[col]):
-            df_fmt[col] = df_fmt[col].apply(
-                lambda x: f"{x:,.2f}".replace(",", "X").replace(".", ",").replace("X", " ")
-                if pd.notnull(x) else ""
-            )
-    return df_fmt
+# scikit-learn for ML discount classification
+SKLEARN_OK = True
+SKLEARN_ERR = ""
+try:
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.pipeline import Pipeline as SkPipeline
+    from sklearn.linear_model import LogisticRegression
+except Exception as e:
+    SKLEARN_OK = False
+    SKLEARN_ERR = str(e)
 
+# ============== BASIC CONFIG ==============
 st.set_page_config(page_title="Финансовый пайплайн | Artel Support", layout="wide")
-
-# ==================== UI HEADER ====================
 st.title("Финансовый пайплайн (G1/G2/G3, D-блок, UZS→USD, ML-скидки)")
 st.caption("Загрузка Excel из CRM → нормализация → корректировки → своды → готовый Excel-отчёт")
 
-# ==================== CONFIG ====================
+MONEY_FORMAT_RU = '# ##0,00'  # Excel number format: 1 234 567,89
 
+# ============== APP CONFIG DATACLASS ==============
 @dataclass
 class PipelineConfig:
     src_sheet: str = "Доставленный"
@@ -82,13 +82,11 @@ class PipelineConfig:
         "service_code","service_unit_price","qty_service","sps_date"
     )
 
-MONEY_FORMAT_RU = '# ##0,00'  # 1 234 567,89
-
-# ==================== SIDEBAR ====================
+# ============== SIDEBAR INPUTS ==============
 st.sidebar.header("Настройки входных данных")
 sheet_name = st.sidebar.text_input("Имя листа в Excel", value="Доставленный")
 excluded_types = st.sidebar.text_input("Исключить из затрат завода (через запятую)", value="ВЫЗОВ, ПРОДАЖА")
-sp_labels = st.sidebar.text_input("Метки запчастей (через запятую)", value="Запчасть")
+sp_labels = st.sidebar.text_input("Метки запчастей (через запчастей)", value="Запчасть")
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("Курсы валют и ML скидок")
@@ -100,7 +98,7 @@ st.sidebar.markdown("---")
 st.sidebar.subheader("Загрузите CRM выгрузку")
 uploaded = st.sidebar.file_uploader("Excel из CRM (.xlsx)", type=["xlsx"])
 
-# ==================== CACHING HELPERS ====================
+# ============== CACHING HELPERS ==============
 @st.cache_data(show_spinner=False)
 def read_excel_cached(file_bytes: bytes, sheet: str) -> pd.DataFrame:
     return pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet)
@@ -143,6 +141,8 @@ def read_training_discounts(file) -> pd.DataFrame:
 
 @st.cache_resource(show_spinner=False)
 def train_discount_classifier(train_df: pd.DataFrame):
+    if not SKLEARN_OK:
+        raise RuntimeError(f"ML-модуль недоступен: {SKLEARN_ERR}")
     pipe = SkPipeline([
         ("tfidf", TfidfVectorizer(max_features=3000, ngram_range=(1,2))),
         ("clf", LogisticRegression(max_iter=300, solver="lbfgs", multi_class="auto"))
@@ -150,7 +150,47 @@ def train_discount_classifier(train_df: pd.DataFrame):
     pipe.fit(train_df["description"].values, train_df["approved_by"].values)
     return pipe
 
-# ==================== PIPELINE FUNCTIONS ====================
+# ============== UI HELPERS ==============
+def is_amount_col(colname: str) -> bool:
+    lc = str(colname).lower()
+    keys = ["sum", "total", "скидк", "сумм", "цена", "дельта", "usd"]
+    return any(k in lc for k in keys)
+
+def add_totals_row_numeric(df: pd.DataFrame, label="ИТОГО") -> pd.DataFrame:
+    if df.empty:
+        return df
+    out = df.copy()
+    num_cols = [c for c in out.columns if pd.api.types.is_numeric_dtype(out[c]) and is_amount_col(c)]
+    if not num_cols:
+        return out
+    totals = {c: out[c].sum(skipna=True) for c in num_cols}
+    # choose a label column for 'ИТОГО'
+    label_col = None
+    for c in ["plant_name","service_group","warranty_type","ticket_id","Номер заявки"]:
+        if c in out.columns:
+            label_col = c
+            break
+    totals_row = {c: "" for c in out.columns}
+    totals_row.update({c: totals[c] for c in num_cols})
+    if label_col:
+        totals_row[label_col] = label
+    out = pd.concat([out, pd.DataFrame([totals_row])], ignore_index=True)
+    return out
+
+def format_numbers_ru(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Format all numeric columns using Russian style: '# ##0,00' in UI tables.
+    """
+    df_fmt = df.copy()
+    for col in df_fmt.columns:
+        if pd.api.types.is_numeric_dtype(df_fmt[col]):
+            df_fmt[col] = df_fmt[col].apply(
+                lambda x: f"{x:,.2f}".replace(",", "X").replace(".", ",").replace("X", " ")
+                if pd.notnull(x) else ""
+            )
+    return df_fmt
+
+# ============== PIPELINE FUNCTIONS ==============
 def load_and_normalize(file_bytes: bytes, cfg: PipelineConfig, sheet_name: Optional[str] = None) -> pd.DataFrame:
     df = read_excel_cached(file_bytes, sheet_name or cfg.src_sheet)
     df.columns = [c.strip() for c in df.columns]
@@ -167,7 +207,7 @@ def load_and_normalize(file_bytes: bytes, cfg: PipelineConfig, sheet_name: Optio
     df[["sum_product","sum_service","discount_service","discount_product","service_unit_price"]] = \
         df[["sum_product","sum_service","discount_service","discount_product","service_unit_price"]].fillna(0)
 
-    # normalize texts/dates
+    # normalize dates
     for dcol in ["sps_date","service_date","post_date","sold_at","created_at"]:
         if dcol in df.columns:
             df[dcol] = pd.to_datetime(df[dcol], errors="coerce")
@@ -187,6 +227,10 @@ def add_line_flags(df: pd.DataFrame, cfg: PipelineConfig) -> pd.DataFrame:
     return df
 
 def apply_latest_service_price(df: pd.DataFrame, cfg: PipelineConfig) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Normalize G1/G2 line service prices to the latest price by service_code and sps_date.
+    Excludes spare parts and G3 lines.
+    """
     df = df.copy()
     elig = (df["warranty_type"].isin(["G1","G2"])) & (~df["is_spare_part"]) & df["service_code"].notna()
     df_elig = df.loc[elig].copy().sort_values(["service_code","sps_date"])
@@ -217,11 +261,12 @@ def apply_latest_service_price(df: pd.DataFrame, cfg: PipelineConfig) -> tuple[p
     audit["old_sum_service"] = old_sum_service_final
     audit["new_sum_service"] = new_sum_service
     audit["delta_sum_service"] = delta
-    audit = audit[audit["delta_sum_service"] != 0]  # comment out to see all
+    audit = audit[audit["delta_sum_service"] != 0]  # keep only changed
     return df, audit
 
 def apply_usd_conversion(df: pd.DataFrame, rates: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
+    # as-of merge by sps_date; fallback to other dates if empty
     working_date = df["sps_date"]
     if working_date.isna().all():
         for fallback in ["service_date","post_date","sold_at","created_at"]:
@@ -429,12 +474,30 @@ def ensure_ticket_id_text(df: pd.DataFrame) -> pd.DataFrame:
         out["Номер заявки"] = out["Номер заявки"].astype(str)
     return out
 
+def _colnum_to_excel(n: int) -> str:
+    # 0-based index -> Excel column letters
+    s = ""
+    n += 1
+    while n:
+        n, r = divmod(n-1, 26)
+        s = chr(65 + r) + s
+    return s
+
 def write_sheets_to_bytes(sheets: Dict[str, pd.DataFrame]) -> bytes:
+    """
+    Writes multiple DataFrames to a single Excel with:
+    - MONEY_FORMAT_RU on amount columns,
+    - ticket_id/Номер заявки as text,
+    - autofit that preserves formats,
+    - bold 'ИТОГО' row with SUM formulas for amount columns.
+    """
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
         wb = writer.book
         fmt_money = wb.add_format({'num_format': MONEY_FORMAT_RU})
         fmt_text  = wb.add_format({'num_format': '@'})
+        fmt_bold  = wb.add_format({'bold': True})
+        fmt_bold_money = wb.add_format({'bold': True, 'num_format': MONEY_FORMAT_RU})
 
         for sheet_name, df in sheets.items():
             df_to_write = ensure_ticket_id_text(df)
@@ -442,30 +505,49 @@ def write_sheets_to_bytes(sheets: Dict[str, pd.DataFrame]) -> bytes:
             ws = writer.sheets[sheet_name]
 
             # Which columns look like money?
-            money_cols = []
-            for c in df_to_write.columns:
-                lc = str(c).lower()
-                if any(k in lc for k in ["sum", "сумм", "скидк", "цена", "дельта", "debt", "receiv", "payable", "usd"]):
-                    money_cols.append(c)
+            money_cols_idx = []
+            for i, c in enumerate(df_to_write.columns):
+                if is_amount_col(c) and pd.api.types.is_numeric_dtype(df_to_write[c]):
+                    money_cols_idx.append(i)
 
-            # Apply formats
+            # Apply formats + basic autofit
             for i, name in enumerate(df_to_write.columns):
                 if name in ("ticket_id", "Номер заявки"):
                     ws.set_column(i, i, 18, fmt_text)
-                elif name in money_cols:
+                elif i in money_cols_idx:
                     ws.set_column(i, i, 16, fmt_money)
+                else:
+                    ws.set_column(i, i, 12)
 
-            # Autofit without losing formats
+            # simple autofit preserving formats
             for i, name in enumerate(df_to_write.columns):
                 vals = df_to_write.iloc[:, i].astype(str).head(200).tolist()
                 width = min(max(10, max(len(str(name)), *(len(v) for v in vals)) + 2), 42)
-                keep_fmt = fmt_text if name in ("ticket_id","Номер заявки") else (fmt_money if name in money_cols else None)
+                keep_fmt = fmt_text if name in ("ticket_id","Номер заявки") else (fmt_money if i in money_cols_idx else None)
                 ws.set_column(i, i, width, keep_fmt)
+
+            # Totals row with formulas
+            nrows = len(df_to_write)
+            if nrows > 0 and money_cols_idx:
+                total_row_excel = nrows + 1  # 1-based row index (header is row 1)
+                # Put "ИТОГО" in first non-money column or column 0
+                label_col = 0
+                for j, name in enumerate(df_to_write.columns):
+                    if j not in money_cols_idx:
+                        label_col = j
+                        break
+                ws.write(total_row_excel, label_col, "ИТОГО", fmt_bold)
+
+                # Each money column: SUM from row 2..nrows+1
+                for j in money_cols_idx:
+                    col_letter = _colnum_to_excel(j)
+                    formula = f"=SUM({col_letter}2:{col_letter}{nrows+1})"
+                    ws.write_formula(total_row_excel, j, formula, fmt_bold_money)
 
     output.seek(0)
     return output.getvalue()
 
-# ==================== UI FILTERS BLOCK ====================
+# ============== UI FILTERS ==============
 def apply_ui_filters(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     c1, c2, c3, c4 = st.columns(4)
@@ -485,7 +567,6 @@ def apply_ui_filters(df: pd.DataFrame) -> pd.DataFrame:
         if w_sel != "(все)":
             df = df[df["warranty_type"] == w_sel]
     with c4:
-        # date filter on sps_date
         min_d = pd.to_datetime(df["sps_date"]).min()
         max_d = pd.to_datetime(df["sps_date"]).max()
         if pd.notna(min_d) and pd.notna(max_d):
@@ -495,8 +576,7 @@ def apply_ui_filters(df: pd.DataFrame) -> pd.DataFrame:
                 df = df[mask]
     return df
 
-# ==================== MAIN FLOW ====================
-
+# ============== MAIN FLOW ==============
 cfg = PipelineConfig(
     src_sheet=sheet_name,
     excluded_for_manufacturer=tuple([s.strip().upper() for s in excluded_types.split(",") if s.strip()]),
@@ -514,7 +594,6 @@ try:
         df = add_line_flags(df, cfg)
         df_before = df.copy()
 
-    # Optional UI filters (preview layer). We’ll apply them only to previews (not to final export).
     st.markdown("### Фильтры предпросмотра")
     df_preview = apply_ui_filters(df)
 
@@ -554,14 +633,11 @@ try:
 
     # ML classification (optional)
     confident_ml, review_ml = pd.DataFrame(), pd.DataFrame()
-    if ml_training_file is not None:
+    if ml_training_file is not None and SKLEARN_OK:
         with st.spinner("Обучаем модель скидок и применяем к текущим данным..."):
             train_df = read_training_discounts(ml_training_file)
             model = train_discount_classifier(train_df)
-            # apply on original df (post-price-adjustment)
-            confident_ml, review_ml = (lambda d: (pd.DataFrame(), pd.DataFrame()))(df)
-            # Try classify on df with discount columns present:
-            # We’ll prefer description from likely columns
+
             def classify_discounts(current_df: pd.DataFrame, model, threshold: float = 0.85):
                 dfc = current_df.copy()
                 text_col = None
@@ -586,36 +662,122 @@ try:
                     pred = model.predict(texts)
                     cand["ML_Метка"] = pred
                     cand["ML_Уверенность"] = np.nan
-                confident_df = cand.loc[cand["ML_Уверенность"] >= ml_threshold].copy()
-                review_df = cand.loc[(cand["ML_Уверенность"] < ml_threshold) | (cand["ML_Уверенность"].isna())].copy()
+                confident_df = cand.loc[cand["ML_Уверенность"] >= cfg.ml_threshold].copy()
+                review_df = cand.loc[(cand["ML_Уверенность"] < cfg.ml_threshold) | (cand["ML_Уверенность"].isna())].copy()
                 return confident_df, review_df
 
-            confident_ml, review_ml = classify_discounts(df, model, threshold=ml_threshold)
+            confident_ml, review_ml = classify_discounts(df, model, threshold=cfg.ml_threshold)
     else:
-        st.info("Не загружен обучающий датасет скидок — классификация пропущена.")
+        if ml_training_file is None:
+            st.info("Не загружен обучающий датасет скидок — классификация пропущена.")
+        elif not SKLEARN_OK:
+            st.info(f"ML-модуль недоступен: {SKLEARN_ERR}. Приложение продолжит работу без классификации скидок.")
 
-    # ==================== PREVIEW ====================
+    # ==================== PREVIEW & DASHBOARD ====================
     st.success("Готово! Предпросмотр ключевых сводок ниже, а также кнопка скачивания Excel.")
 
-    c1, c2 = st.columns(2)
-    with c1:
+    # --- DASHBOARD KPI (UZS)
+    st.markdown("### 📊 Дашборд — ключевые показатели")
+    k1, k2, k3, k4 = st.columns(4)
+    def safe_sum(df_, col): return float(pd.to_numeric(df_.get(col, pd.Series(dtype=float)), errors="coerce").sum())
+
+    total_uzs = safe_sum(df, "sum_total")
+    total_disc = safe_sum(df, "discount_total")
+    total_service = safe_sum(df, "sum_service")
+    total_product = safe_sum(df, "sum_product")
+
+    k1.metric("Итого оборот (UZS)", f"{total_uzs:,.2f}".replace(",", "X").replace(".", ",").replace("X", " "))
+    k2.metric("Скидки всего (UZS)", f"{total_disc:,.2f}".replace(",", "X").replace(".", ",").replace("X", " "))
+    k3.metric("Услуги (UZS)", f"{total_service:,.2f}".replace(",", "X").replace(".", ",").replace("X", " "))
+    k4.metric("Материалы (UZS)", f"{total_product:,.2f}".replace(",", "X").replace(".", ",").replace("X", " "))
+
+    # --- Optional USD KPI
+    if "sum_total_usd" in df.columns:
+        k5, k6, k7, k8 = st.columns(4)
+        k5.metric("Итого оборот (USD)", f"{safe_sum(df,'sum_total_usd'):,.2f}")
+        k6.metric("Скидки (USD)", f"{safe_sum(df,'discount_total_usd'):,.2f}")
+        k7.metric("Услуги (USD)", f"{safe_sum(df,'sum_service_usd'):,.2f}")
+        k8.metric("Материалы (USD)", f"{safe_sum(df,'sum_product_usd'):,.2f}")
+
+    # --- CHARTS
+    st.markdown("### 📈 Графики")
+    if ALTAIR_OK:
+        c1c, c2c = st.columns(2)
+
+        with c1c:
+            top_plants = (
+                df[df["warranty_type"].isin(["G1","G2"])]
+                .groupby("plant_name", as_index=False)["sum_total"].sum()
+                .sort_values("sum_total", ascending=False).head(10)
+            )
+            if not top_plants.empty:
+                chart1 = alt.Chart(top_plants).mark_bar().encode(
+                    x=alt.X("sum_total:Q", title="Оборот (UZS)"),
+                    y=alt.Y("plant_name:N", sort='-x', title="Завод"),
+                    tooltip=["plant_name","sum_total"]
+                ).properties(height=320)
+                st.altair_chart(chart1, use_container_width=True)
+
+        with c2c:
+            g3_grp = (
+                df[df["warranty_type"]=="G3"]
+                .groupby("service_group", as_index=False)["sum_total"].sum()
+                .sort_values("sum_total", ascending=False).head(10)
+            )
+            if not g3_grp.empty:
+                chart2 = alt.Chart(g3_grp).mark_bar().encode(
+                    x=alt.X("sum_total:Q", title="Оборот G3 (UZS)"),
+                    y=alt.Y("service_group:N", sort='-x', title="Группа услуг"),
+                    tooltip=["service_group","sum_total"]
+                ).properties(height=320)
+                st.altair_chart(chart2, use_container_width=True)
+
+        if df["sps_date"].notna().any():
+            ts = (
+                df.dropna(subset=["sps_date"])
+                  .assign(day=lambda d: pd.to_datetime(d["sps_date"]).dt.date)
+                  .groupby("day", as_index=False)["sum_total"].sum()
+                  .sort_values("day")
+            )
+            if not ts.empty:
+                st.altair_chart(
+                    alt.Chart(ts).mark_line(point=True).encode(
+                        x=alt.X("day:T", title="Дата СПС"),
+                        y=alt.Y("sum_total:Q", title="Оборот (UZS)"),
+                        tooltip=["day","sum_total"]
+                    ).properties(height=300),
+                    use_container_width=True
+                )
+    else:
+        st.info("Altair недоступен — графики отключены.")
+
+    # --- TABLES (with totals row and RU formatting for UI)
+    c1t, c2t = st.columns(2)
+    with c1t:
         st.subheader("Итоги по гарантии (UZS)")
-        st.dataframe(format_numbers_ru(warranty_totals.head(200)))
+        st.dataframe(format_numbers_ru(add_totals_row_numeric(warranty_totals).head(200)))
+
         st.subheader("AR по заводам — свод (UZS)")
-        st.dataframe(format_numbers_ru(ar_summary.head(200)))
+        st.dataframe(format_numbers_ru(add_totals_row_numeric(ar_summary).head(200)))
+
         if usd_enabled:
             st.subheader("Итоги по гарантии (USD)")
-            st.dataframe(format_numbers_ru(warranty_totals_usd.head(200)))
+            st.dataframe(format_numbers_ru(add_totals_row_numeric(warranty_totals_usd).head(200)))
+
             st.subheader("AR по заводам — свод (USD)")
-            st.dataframe(format_numbers_ru(ar_summary_usd.head(200)))
-    with c2:
+            st.dataframe(format_numbers_ru(add_totals_row_numeric(ar_summary_usd).head(200)))
+
+    with c2t:
         st.subheader("G3 — свод (UZS)")
-        st.dataframe(format_numbers_ru(g3_summary.head(200)))
+        st.dataframe(format_numbers_ru(add_totals_row_numeric(g3_summary).head(200)))
+
         if usd_enabled:
             st.subheader("G3 — свод (USD)")
-            st.dataframe(format_numbers_ru(g3_summary_usd.head(200)))
+            st.dataframe(format_numbers_ru(add_totals_row_numeric(g3_summary_usd).head(200)))
+
         st.subheader("Изменённые цены (свод)")
-        st.dataframe(format_numbers_ru(changed_summary.head(200)))
+        st.dataframe(format_numbers_ru(add_totals_row_numeric(changed_summary).head(200)))
+
         if not confident_ml.empty:
             st.subheader("Скидки (ML, уверенные предсказания)")
             st.dataframe(format_numbers_ru(confident_ml.head(200)))
