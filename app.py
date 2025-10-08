@@ -600,28 +600,28 @@ try:
     c1, c2 = st.columns(2)
     with c1:
         st.subheader("Итоги по гарантии (UZS)")
-        st.dataframe(format_numbers_ru(warranty_totals.head(200))
+        st.dataframe(format_numbers_ru(warranty_totals.head(200)))
         st.subheader("AR по заводам — свод (UZS)")
-        st.dataframe(format_numbers_ru(ar_summary.head(200))
+        st.dataframe(format_numbers_ru(ar_summary.head(200)))
         if usd_enabled:
             st.subheader("Итоги по гарантии (USD)")
-            st.dataframe(format_numbers_ru(warranty_totals_usd.head(200))
+            st.dataframe(format_numbers_ru(warranty_totals_usd.head(200)))
             st.subheader("AR по заводам — свод (USD)")
-            st.dataframe(format_numbers_ru(ar_summary_usd.head(200))
+            st.dataframe(format_numbers_ru(ar_summary_usd.head(200)))
     with c2:
         st.subheader("G3 — свод (UZS)")
-        st.dataframe(format_numbers_ru(g3_summary.head(200))
+        st.dataframe(format_numbers_ru(g3_summary.head(200)))
         if usd_enabled:
             st.subheader("G3 — свод (USD)")
-            st.dataframe(format_numbers_ru(g3_summary_usd.head(200))
+            st.dataframe(format_numbers_ru(g3_summary_usd.head(200)))
         st.subheader("Изменённые цены (свод)")
-        st.dataframe(format_numbers_ru(changed_summary.head(200))
+        st.dataframe(format_numbers_ru(changed_summary.head(200)))
         if not confident_ml.empty:
             st.subheader("Скидки (ML, уверенные предсказания)")
-            st.dataframe(format_numbers_ru(confident_ml.head(200))
+            st.dataframe(format_numbers_ru(confident_ml.head(200)))
         if not review_ml.empty:
             st.subheader("Скидки (на ручную проверку)")
-            st.dataframe(format_numbers_ru(review_ml.head(200))
+            st.dataframe(format_numbers_ru(review_ml.head(200)))
 
     # ==================== EXCEL EXPORT ====================
     sheets = {
