@@ -31,29 +31,101 @@ import pandas as pd
 import streamlit as st
 
 # ===================== Import only AVAILABLE things =======================
-# Your finance_core.py (current revision) exposes these names:
-from finance_core import (  # type: ignore
-    read_excel_any,
-    translate_columns,
-    normalize,                         # (df, corr_map) -> (df_norm, dq)
-    compute_g1_transport,
-    SPECIAL_CORR_DEFAULT,
-    CORRESPONDENT_MAP_DEFAULT,
-    normalize_expenditures,
-    validate_expenditures,
-    compare_expenditures,
-    parse_month_ru,
-)
+# ---------- BEGIN robust finance_core import (drop-in) ----------
+import os, sys
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+if BASE_DIR not in sys.path:
+    sys.path.insert(0, BASE_DIR)
 
-# We will NOT import: validate_revenue, normalize_revenue, compare_ranges_revenue,
-# export_excel(bytes), build_pptx, build_pdf, load_month_amount_file
-# because they aren't present in your current finance_core.py version.
+def _import_core():
+    # try common filenames/paths
+    for name in ("finance_core", "Monthly_pipeline_3", "core.finance_core"):
+        try:
+            return __import__(name, fromlist=["*"])
+        except Exception:
+            continue
+    raise ImportError("Could not import finance_core (also tried Monthly_pipeline_3, core.finance_core).")
 
-# If your core exposes DATE_SOURCE, use it; otherwise default to "Data of Document"
 try:
-    from finance_core import DATE_SOURCE as _DATE_SOURCE_DEFAULT  # type: ignore
-except Exception:
-    _DATE_SOURCE_DEFAULT = "Data of Document"
+    _core = _import_core()
+except Exception as e:
+    import streamlit as st
+    st.error(
+        "Could not import the finance core module.\n\n"
+        "Make sure **finance_core.py** (or **Monthly_pipeline_3.py**) is in the SAME folder as `app.py`."
+    )
+    st.code(
+        "cwd: " + os.getcwd() + "\n"
+        "here: " + BASE_DIR + "\n"
+        "files: " + ", ".join(sorted(os.listdir(BASE_DIR))) + "\n"
+        "sys.path[0..5]: " + ", ".join(map(str, sys.path[:6]))
+    )
+    st.exception(e)
+    st.stop()
+
+# Required symbols
+run_analysis           = getattr(_core, "run_analysis")
+read_excel_any         = getattr(_core, "read_excel_any")
+validate_expenditures  = getattr(_core, "validate_expenditures")
+normalize_expenditures = getattr(_core, "normalize_expenditures")
+compare_expenditures   = getattr(_core, "compare_expenditures")
+export_excel_core      = getattr(_core, "export_excel")
+SPECIAL_CORR_DEFAULT   = getattr(_core, "SPECIAL_CORR_DEFAULT", [])
+VAT_RATE_DEFAULT       = getattr(_core, "VAT_RATE", 0.12)
+VAT_MODE_DEFAULT       = getattr(_core, "VAT_MODE", "extract")
+
+# Optional helpers (used by Revenue tab)
+translate_columns      = getattr(_core, "translate_columns", None)
+normalize_core         = getattr(_core, "normalize", None)
+compute_g1_transport   = getattr(_core, "compute_g1_transport", None)
+
+# ---- Shims for names older app code expects but may not exist in core ----
+from types import SimpleNamespace
+
+# validate_revenue shim
+validate_revenue = getattr(_core, "validate_revenue", None)
+if validate_revenue is None:
+    def validate_revenue(df):
+        try:
+            if translate_columns:
+                translate_columns(df, verbose=False)
+            return SimpleNamespace(ok=True, missing=[], suggestions={})
+        except Exception as e:
+            return SimpleNamespace(ok=False, missing=["Revenue columns"], suggestions=str(e))
+
+# normalize_revenue shim
+normalize_revenue = getattr(_core, "normalize_revenue", None)
+if normalize_revenue is None:
+    def normalize_revenue(d, corr_map=None, special_corr=None):
+        corr_map = corr_map or getattr(_core, "CORRESPONDENT_MAP_DEFAULT", {})
+        special_corr = special_corr or SPECIAL_CORR_DEFAULT
+        if translate_columns:
+            d = translate_columns(d, verbose=False)
+        if normalize_core:
+            d, _ = normalize_core(d, corr_map)
+        if compute_g1_transport:
+            d = compute_g1_transport(d, special_corr)
+        return d
+
+# Optional API referenced by some variants of the UI
+months_between         = getattr(_core, "months_between", None)
+compare_ranges_revenue = getattr(_core, "compare_ranges_revenue", None)
+summarize_expenditures = getattr(_core, "summarize_expenditures", None)
+build_pptx             = getattr(_core, "build_pptx", None)
+build_pdf              = getattr(_core, "build_pdf", None)
+load_month_amount_file = getattr(_core, "load_month_amount_file", None)
+
+# Wrap exporter to return bytes for st.download_button
+def export_excel(sheets_dict):
+    import tempfile, datetime as _dt
+    out_path = os.path.join(
+        tempfile.gettempdir(),
+        f"financial_report__{_dt.datetime.now().strftime('%Y%m%d-%H%M%S')}.xlsx"
+    )
+    export_excel_core(sheets_dict, out_path)
+    with open(out_path, "rb") as f:
+        return f.read()
+# ---------- END robust finance_core import ----------
 
 # ============================ Helpers (local) =============================
 
