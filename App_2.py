@@ -310,6 +310,7 @@ class PipelineConfig:
         "Количество услуг": "qty_service",
         "Дата оказания": "service_date",
         "Дата проведения": "post_date",
+        "Скидки": "Discounts"
     })
     required_cols: Tuple[str, ...] = (
         "ticket_id","warranty_type","service_group","sum_product","sum_service",
